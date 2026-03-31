@@ -113,6 +113,8 @@ class PlatformNodesFactory:
             "kubevirt_vm": KubevirtVMNodes,
             "ibm_cloud_ipi": IBMCloudIPI,
             "baremetal_ai": IBMCloudBMNodes,
+            "ibmz_zvm": IBMZZVMNodes,
+            "ibmz_kvm": IBMZKVMNodes,
         }
 
     def get_nodes_platform(self):
@@ -3874,3 +3876,195 @@ class HypershiftAWSNode(AWSNodes):
             node_list.append(HypershiftAWSNode(node_conf, constants.RHCOS))
 
         return node_list
+
+
+
+class IBMZZVMNodes(NodesBase):
+    """
+    IBM Z z/VM platform nodes implementation.
+    
+    Manages z/VM guest nodes via bastion host using existing cluster-config.yaml
+    and automation scripts at /root/zVM_automation/AUTOMATION.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        from ocs_ci.utility.ibmz import ZVMBastionManager
+        self.bastion_mgr = ZVMBastionManager()
+        logger.info("Initialized IBM Z z/VM platform nodes manager")
+    
+    def stop_nodes(self, nodes):
+        """
+        Stop (shutdown) z/VM guest nodes
+        
+        Args:
+            nodes (list): List of OCP node objects
+        """
+        logger.info(f"Stopping {len(nodes)} z/VM nodes")
+        
+        for node in nodes:
+            logger.info(f"Stopping node: {node.name}")
+            try:
+                self.bastion_mgr.shutdown_node(node)
+            except Exception as e:
+                logger.error(f"Failed to stop {node.name}: {e}")
+                raise
+    
+    def start_nodes(self, nodes):
+        """
+        Start z/VM guest nodes
+        
+        Args:
+            nodes (list): List of OCP node objects
+        """
+        logger.info(f"Starting {len(nodes)} z/VM nodes")
+        
+        for node in nodes:
+            logger.info(f"Starting node: {node.name}")
+            try:
+                self.bastion_mgr.start_node(node)
+            except Exception as e:
+                logger.error(f"Failed to start {node.name}: {e}")
+                raise
+    
+    def restart_nodes(self, nodes, force=True, wait=True, timeout=900):
+        """
+        Restart z/VM guest nodes
+        
+        Args:
+            nodes (list): List of OCP node objects
+            force (bool): Force reboot (always true for z/VM)
+            wait (bool): Wait for nodes to return to Ready state
+            timeout (int): Timeout in seconds for nodes to be ready
+        """
+        logger.info(f"Restarting {len(nodes)} z/VM nodes")
+        
+        # Get reboot events before restart
+        num_events_pre_reboot = {}
+        if wait:
+            num_events_pre_reboot = self.get_reboot_events(nodes)
+        
+        # Reboot each node
+        for node in nodes:
+            logger.info(f"Initiating reboot for node: {node.name}")
+            
+            try:
+                self.bastion_mgr.reboot_node(node)
+            except Exception as e:
+                logger.error(f"Failed to reboot {node.name}: {e}")
+                raise
+        
+        if wait:
+            # Wait for nodes to be ready
+            node_names = [n.name for n in nodes]
+            logger.info(f"Waiting for nodes to be ready: {node_names}")
+            
+            wait_for_nodes_status(
+                node_names=node_names,
+                status=constants.NODE_READY,
+                timeout=timeout
+            )
+            
+            # Verify reboot events
+            logger.info("Verifying reboot events")
+            for node in nodes:
+                try:
+                    for node_reboot_events in TimeoutSampler(
+                        timeout=300, sleep=3,
+                        func=self.get_reboot_events, nodes=[node]
+                    ):
+                        if (node_reboot_events[node.name] 
+                            != num_events_pre_reboot[node.name]):
+                            logger.info(f"Reboot event detected for {node.name}")
+                            break
+                except TimeoutExpiredError:
+                    logger.error(
+                        f"Reboot event not found for {node.name}"
+                    )
+                    raise RebootEventNotFoundException(
+                        f"No reboot event found for {node.name}"
+                    )
+                
+                logger.info(f"Node {node.name} rebooted successfully")
+    
+    def restart_nodes_by_stop_and_start(self, nodes, force=True, wait=True):
+        """
+        Stop and start nodes (explicit shutdown then startup)
+        
+        Args:
+            nodes (list): List of OCP node objects
+            force (bool): Force operations
+            wait (bool): Wait for nodes to be ready
+        """
+        logger.info(f"Stopping and starting {len(nodes)} z/VM nodes")
+        
+        # Stop all nodes
+        self.stop_nodes(nodes)
+        
+        # Wait a bit for clean shutdown
+        import time
+        time.sleep(30)
+        
+        # Start all nodes
+        self.start_nodes(nodes)
+        
+        if wait:
+            node_names = [n.name for n in nodes]
+            wait_for_nodes_status(
+                node_names=node_names,
+                status=constants.NODE_READY,
+                timeout=900
+            )
+    
+    def restart_nodes_by_stop_and_start_teardown(self):
+        """
+        Start nodes that are in NotReady state (teardown helper)
+        """
+        not_ready_nodes = get_nodes_in_statuses([constants.NODE_NOT_READY])
+        if not_ready_nodes:
+            logger.info(f"Starting {len(not_ready_nodes)} NotReady nodes")
+            self.start_nodes(not_ready_nodes)
+    
+    def get_reboot_events(self, nodes):
+        """
+        Get count of reboot events for nodes
+        
+        Args:
+            nodes (list): List of OCP node objects
+            
+        Returns:
+            dict: Node name to reboot event count mapping
+        """
+        num_reboot_events = {}
+        for node in nodes:
+            reboot_events_cmd = (
+                f"get events -A --field-selector involvedObject.name="
+                f"{node.name},reason=Rebooted -o yaml"
+            )
+            num_reboot_events[node.name] = len(
+                node.ocp.exec_oc_cmd(reboot_events_cmd)["items"]
+            )
+        return num_reboot_events
+
+
+class IBMZKVMNodes(NodesBase):
+    """
+    IBM Z KVM platform nodes implementation.
+    
+    Placeholder for future KVM on Z support.
+    Similar to IBMZZVMNodes but uses libvirt/virsh commands.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        logger.info("Initialized IBM Z KVM platform nodes manager")
+        logger.warning("IBM Z KVM support is not yet implemented")
+    
+    def restart_nodes(self, nodes, force=True, wait=True, timeout=900):
+        """
+        Restart KVM guests (not yet implemented)
+        """
+        raise NotImplementedError(
+            "IBM Z KVM support is not yet implemented. "
+            "Please use ibmz_zvm platform for z/VM guests."
+        )

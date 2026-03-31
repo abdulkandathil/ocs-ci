@@ -1,0 +1,40 @@
+---
+# IBM Z z/VM platform configuration
+# This configuration is for IBM Z (s390x) clusters running on z/VM hypervisor
+
+ENV_DATA:
+  platform: 'ibmz_zvm'
+  deployment_type: 'upi'
+  multi_arch: true
+  arch: 's390x'
+  
+  # Bastion host configuration
+  # The bastion host has cluster_config.yaml at /usr/local/bin/vmtools/cluster_config.yaml
+  # and automation scripts at /root/zVM_automation/AUTOMATION
+  ibmz_bastion:
+    host: '172.23.232.84'  # Bastion host IP - UPDATE THIS
+    user: 'root'
+    ssh_key: '~/.ssh/zvm-bastion-key'  # Path to SSH private key
+    # password: 'bastion_password'  # Alternative to ssh_key (use auth.yaml for security)
+  
+  # CPU and memory for nodes (used during reboot operations)
+  master_cpu: 4
+  master_memory: 16384  # MB
+  worker_cpu: 8
+  worker_memory: 32768  # MB
+  
+  # Node specifications (read from cluster_config.yaml on bastion)
+  master_replicas: 3
+  worker_replicas: 4
+  
+  # Skip OCP deployment (cluster already exists)
+  skip_ocp_deployment: true
+  skip_ocs_deployment: false
+
+DEPLOYMENT:
+  ssh_key: '~/.ssh/openshift-dev.pub'
+
+RUN:
+  kubeconfig_location: 'auth/kubeconfig'
+
+# Made with Bob
