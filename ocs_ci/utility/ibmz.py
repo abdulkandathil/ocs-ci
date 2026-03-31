@@ -218,7 +218,10 @@ class ZVMBastionManager:
     
     def shutdown_node(self, node_obj):
         """
-        Shutdown a z/VM guest node
+        Shutdown a z/VM guest node by shutting down the Linux guest OS
+        
+        Uses 'oc debug' to execute shutdown command inside the node's Linux OS.
+        This is a graceful shutdown that allows the OS to shut down properly.
         
         Args:
             node_obj: OCP node object
@@ -226,25 +229,33 @@ class ZVMBastionManager:
         Returns:
             bool: True if shutdown successful
         """
-        node_config = self.map_ocp_node_to_zvm_guest(node_obj)
-        zvm_user = node_config['zvm']['user']
+        from ocs_ci.utility.utils import run_cmd
         
-        logger.info(f"Shutting down z/VM guest: {zvm_user}")
+        node_name = node_obj.name
+        logger.info(f"Shutting down node {node_name} via oc debug")
         
-        # Use vmcp to force logoff the guest
-        cmd = f"vmcp force {zvm_user} logoff"
-        stdout, stderr, rc = self._ssh_execute(cmd, timeout=120)
+        # Use oc debug to execute shutdown command in the node's Linux OS
+        cmd = f"oc debug node/{node_name} -- chroot /host sudo shutdown now"
         
-        if rc != 0:
-            logger.error(f"Shutdown failed for {zvm_user}: {stderr}")
-            raise CommandFailed(f"Failed to shutdown {zvm_user}: {stderr}")
-        
-        logger.info(f"Successfully shut down {zvm_user}")
-        return True
+        try:
+            run_cmd(cmd, timeout=60)
+            logger.info(f"Successfully initiated shutdown for {node_name}")
+            return True
+        except Exception as e:
+            # Shutdown command may cause connection to drop, which is expected
+            if "EOF" in str(e) or "connection" in str(e).lower():
+                logger.info(f"Shutdown initiated for {node_name} (connection dropped as expected)")
+                return True
+            else:
+                logger.error(f"Shutdown failed for {node_name}: {e}")
+                raise CommandFailed(f"Failed to shutdown {node_name}: {e}")
     
     def start_node(self, node_obj):
         """
-        Start a z/VM guest node
+        Start a z/VM guest node using the Python automation script
+        
+        Uses the ZVM_BOOT_NODES_3270.py script with --reboot 1 flag to properly
+        start the z/VM guest and boot from disk.
         
         Args:
             node_obj: OCP node object
@@ -254,12 +265,77 @@ class ZVMBastionManager:
         """
         node_config = self.map_ocp_node_to_zvm_guest(node_obj)
         zvm_user = node_config['zvm']['user']
+        zvm_host = node_config['zvm']['host']
+        zvm_pass = node_config['zvm']['password']
         
         logger.info(f"Starting z/VM guest: {zvm_user}")
         
-        # Use vmcp to autolog the guest
-        cmd = f"vmcp xautolog {zvm_user}"
-        stdout, stderr, rc = self._ssh_execute(cmd, timeout=120)
+        # Build disk configuration
+        disk_args = []
+        if 'lun' in node_config:
+            # FCP disk
+            for lun in node_config['lun']:
+                lun_id = lun['id'].replace('0x', '')  # Remove '0x' prefix
+                for path in lun['paths']:
+                    fcp_dev = path['fcp']
+                    wwpn = path['wwpn'].replace('0x', '')  # Remove '0x' prefix
+                    disk_args.extend([
+                        f"--disk_dev {fcp_dev}",
+                        f"--fcp_rport {wwpn}",
+                        f"--fcp_lun {lun_id}"
+                    ])
+            disk_type = "FCP"
+        elif 'eckd' in node_config:
+            # ECKD disk
+            disk_dev = node_config['eckd']['id'].replace('0.', '')  # Remove '0.' prefix
+            disk_args.append(f"--disk_dev {disk_dev}")
+            disk_type = "ECKD"
+        elif 'fba' in node_config:
+            # FBA disk
+            disk_dev = node_config['fba']['id']
+            disk_args.append(f"--disk_dev {disk_dev}")
+            disk_type = "EDEV"
+        else:
+            raise ValueError(f"No disk configuration found for {zvm_user}")
+        
+        # Build network configuration
+        net_type = "VSWITCH"  # Default, can be extended
+        if 'vnic' in node_config:
+            net_dev_parts = node_config['vnic']['id'].split(',')
+            net_dev = ' '.join([part.split('.')[-1] for part in net_dev_parts])
+        elif 'osa' in node_config:
+            net_dev_parts = node_config['osa']['id'].split(',')
+            net_dev = ' '.join([part.split('.')[-1] for part in net_dev_parts])
+            net_type = "OSA"
+        elif 'pci' in node_config:
+            net_dev = node_config['pci']['id']
+            net_type = "PCI"
+        else:
+            raise ValueError(f"No network configuration found for {zvm_user}")
+        
+        # Get CPU and memory from config or use defaults based on role
+        if node_config['role'] == 'master':
+            cpu = config.ENV_DATA.get('master_cpu', 4)
+            memory = config.ENV_DATA.get('master_memory', 16384)
+        else:
+            cpu = config.ENV_DATA.get('worker_cpu', 8)
+            memory = config.ENV_DATA.get('worker_memory', 32768)
+        
+        # Execute start via Python script with --reboot 1 flag
+        cmd = f"""cd {self.scripts_path} && python3 ZVM_BOOT_NODES_3270.py \
+--zvmname {zvm_user} \
+--zvmhost {zvm_host} \
+--zvmuser {zvm_user} \
+--zvmpass {zvm_pass} \
+--cpu {cpu} \
+--memory {memory} \
+--disk_type {disk_type} \
+{' '.join(disk_args)} \
+--net_type "{net_type}" \
+--net_dev "{net_dev}" \
+--reboot 1"""
+        
+        stdout, stderr, rc = self._ssh_execute(cmd, timeout=600)
         
         if rc != 0:
             logger.error(f"Start failed for {zvm_user}: {stderr}")
@@ -270,7 +346,10 @@ class ZVMBastionManager:
     
     def reboot_node(self, node_obj):
         """
-        Reboot a z/VM guest node using automation script
+        Reboot a z/VM guest node using the Python automation script
+        
+        Uses the ZVM_BOOT_NODES_3270.py script with --reboot 1 flag to properly
+        reboot the z/VM guest and boot from disk.
         
         Args:
             node_obj: OCP node object
@@ -290,10 +369,10 @@ class ZVMBastionManager:
         if 'lun' in node_config:
             # FCP disk
             for lun in node_config['lun']:
-                lun_id = lun['id'][2:]  # Remove '0x' prefix
+                lun_id = lun['id'].replace('0x', '')  # Remove '0x' prefix
                 for path in lun['paths']:
                     fcp_dev = path['fcp']
-                    wwpn = path['wwpn'][2:]  # Remove '0x' prefix
+                    wwpn = path['wwpn'].replace('0x', '')  # Remove '0x' prefix
                     disk_args.extend([
                         f"--disk_dev {fcp_dev}",
                         f"--fcp_rport {wwpn}",
@@ -302,7 +381,7 @@ class ZVMBastionManager:
             disk_type = "FCP"
         elif 'eckd' in node_config:
             # ECKD disk
-            disk_dev = node_config['eckd']['id']
+            disk_dev = node_config['eckd']['id'].replace('0.', '')  # Remove '0.' prefix
             disk_args.append(f"--disk_dev {disk_dev}")
             disk_type = "ECKD"
         elif 'fba' in node_config:
@@ -314,29 +393,41 @@ class ZVMBastionManager:
             raise ValueError(f"No disk configuration found for {zvm_user}")
         
         # Build network configuration
-        net_type = "VSWITCH"  # Default
-        net_dev = node_config['vnic']['id']
+        net_type = "VSWITCH"  # Default, can be extended
+        if 'vnic' in node_config:
+            net_dev_parts = node_config['vnic']['id'].split(',')
+            net_dev = ' '.join([part.split('.')[-1] for part in net_dev_parts])
+        elif 'osa' in node_config:
+            net_dev_parts = node_config['osa']['id'].split(',')
+            net_dev = ' '.join([part.split('.')[-1] for part in net_dev_parts])
+            net_type = "OSA"
+        elif 'pci' in node_config:
+            net_dev = node_config['pci']['id']
+            net_type = "PCI"
+        else:
+            raise ValueError(f"No network configuration found for {zvm_user}")
         
-        # Get CPU and memory from config or use defaults
-        cpu = config.ENV_DATA.get('master_cpu', 4) if node_config['role'] == 'master' else config.ENV_DATA.get('worker_cpu', 8)
-        memory = config.ENV_DATA.get('master_memory', 16384) if node_config['role'] == 'master' else config.ENV_DATA.get('worker_memory', 32768)
+        # Get CPU and memory from config or use defaults based on role
+        if node_config['role'] == 'master':
+            cpu = config.ENV_DATA.get('master_cpu', 4)
+            memory = config.ENV_DATA.get('master_memory', 16384)
+        else:
+            cpu = config.ENV_DATA.get('worker_cpu', 8)
+            memory = config.ENV_DATA.get('worker_memory', 32768)
         
-        # Execute reboot via Python script
-        cmd = f"""
-        cd {self.scripts_path} && \
-        python3 ZVM_BOOT_NODES_3270.py \
-            --zvmname {zvm_user} \
-            --zvmhost {zvm_host} \
-            --zvmuser {zvm_user} \
-            --zvmpass {zvm_pass} \
-            --cpu {cpu} \
-            --memory {memory} \
-            --disk_type {disk_type} \
-            {' '.join(disk_args)} \
-            --net_type "{net_type}" \
-            --net_dev "{net_dev}" \
-            --reboot 1
-        """
+        # Execute reboot via Python script with --reboot 1 flag
+        cmd = f"""cd {self.scripts_path} && python3 ZVM_BOOT_NODES_3270.py \
+--zvmname {zvm_user} \
+--zvmhost {zvm_host} \
+--zvmuser {zvm_user} \
+--zvmpass {zvm_pass} \
+--cpu {cpu} \
+--memory {memory} \
+--disk_type {disk_type} \
+{' '.join(disk_args)} \
+--net_type "{net_type}" \
+--net_dev "{net_dev}" \
+--reboot 1"""
         
         stdout, stderr, rc = self._ssh_execute(cmd, timeout=600)
         
