@@ -174,21 +174,26 @@ run-ci \
 ### Supported Operations
 
 1. **Reboot Node**: `restart_nodes(nodes)`
-   - Uses `ZVM_BOOT_NODES_3270.py --reboot 1`
-   - Performs IPL from disk
+   - Uses `ZVM_BOOT_NODES_3270.py --reboot 1` for proper disk-based IPL
+   - Performs graceful reboot through Python automation script
+   - Automatically approves Certificate Signing Requests (CSRs) after restart
    - Waits for node to return to Ready state
 
 2. **Shutdown Node**: `stop_nodes(nodes)`
-   - Uses `vmcp force <guest> logoff`
-   - Forces guest logoff
+   - Uses `oc debug node/<name> -- chroot /host sudo shutdown now`
+   - Performs graceful Linux OS shutdown
+   - Filters out bootstrap nodes to prevent accidental shutdown in production
 
 3. **Start Node**: `start_nodes(nodes)`
-   - Uses `vmcp xautolog <guest>`
-   - Starts guest via autolog
+   - Calls `ZVM_BOOT_NODES_3270.py --reboot 1` via automation script
+   - Uses tessia-baselib for proper z/VM hypervisor management
+   - Automatically approves pending CSRs to allow node to rejoin cluster
+   - No manual CSR approval required
 
 4. **Stop and Start**: `restart_nodes_by_stop_and_start(nodes)`
    - Explicit shutdown followed by startup
    - 30-second delay between operations
+   - CSR auto-approval included in start operation
 
 ## Implementation Details
 
@@ -202,17 +207,18 @@ run-ci \
 
 Main methods:
 - `load_cluster_config()`: Reads cluster_config.yaml from bastion
-- `map_ocp_node_to_zvm_guest()`: Maps OCP nodes to z/VM guests
-- `reboot_node()`: Reboots a z/VM guest
-- `shutdown_node()`: Shuts down a z/VM guest
-- `start_node()`: Starts a z/VM guest
+- `map_ocp_node_to_zvm_guest()`: Maps OCP nodes to z/VM guests using IP/role/name strategies
+- `reboot_node()`: Reboots a z/VM guest using Python automation script
+- `shutdown_node()`: Gracefully shuts down Linux OS using `oc debug`
+- `start_node()`: Starts a z/VM guest and auto-approves CSRs
+- `_approve_node_csrs()`: Automatically approves pending CSRs for restarted nodes
 
 ### IBMZZVMNodes Class
 
 Implements the platform-specific node operations:
 - `restart_nodes()`: Reboot nodes with event verification
-- `stop_nodes()`: Shutdown nodes
-- `start_nodes()`: Start nodes
+- `stop_nodes()`: Shutdown nodes (filters out bootstrap nodes)
+- `start_nodes()`: Start nodes (includes CSR auto-approval)
 - `restart_nodes_by_stop_and_start()`: Stop then start
 - `get_reboot_events()`: Verify reboot events in Kubernetes
 
@@ -261,6 +267,40 @@ If reboot events are not detected:
 2. Verify Kubernetes events: `oc get events -A | grep Reboot`
 3. Check z/VM guest status on bastion
 4. Review automation script output in logs
+
+### Certificate Signing Requests (CSR) Issues
+
+**Problem**: Nodes stuck in NotReady state after restart with pending CSRs
+
+**Solution**: CSRs are now automatically approved by the implementation
+```bash
+# Check for pending CSRs (should be auto-approved)
+oc get csr | grep Pending
+
+# If CSRs are still pending, check logs
+grep "Approving CSR" <log_file>
+
+# Manual approval if needed (shouldn't be necessary)
+oc get csr -o name | xargs oc adm certificate approve
+```
+
+### Bootstrap Node Protection
+
+**Problem**: Bootstrap node was accidentally stopped/restarted
+
+**Solution**: Bootstrap nodes are now automatically filtered out
+```bash
+# Verify bootstrap filtering in logs
+grep "Skipping.*bootstrap" <log_file>
+
+# Check which nodes are being operated on
+grep "Stopping node:" <log_file>
+```
+
+The implementation now:
+- Filters out any node with 'bootstrap' in its name
+- Logs a warning when bootstrap nodes are skipped
+- Only operates on actual cluster nodes (masters/workers)
 
 ## Limitations
 
