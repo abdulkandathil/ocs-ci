@@ -3897,12 +3897,21 @@ class IBMZZVMNodes(NodesBase):
         """
         Stop (shutdown) z/VM guest nodes
         
+        Filters out bootstrap nodes to avoid stopping them in production.
+        
         Args:
             nodes (list): List of OCP node objects
         """
-        logger.info(f"Stopping {len(nodes)} z/VM nodes")
+        # Filter out bootstrap nodes
+        filtered_nodes = [n for n in nodes if 'bootstrap' not in n.name.lower()]
         
-        for node in nodes:
+        if len(filtered_nodes) < len(nodes):
+            skipped = len(nodes) - len(filtered_nodes)
+            logger.warning(f"Skipping {skipped} bootstrap node(s) - they should not be stopped in production")
+        
+        logger.info(f"Stopping {len(filtered_nodes)} z/VM nodes")
+        
+        for node in filtered_nodes:
             logger.info(f"Stopping node: {node.name}")
             try:
                 self.bastion_mgr.shutdown_node(node)
@@ -3913,6 +3922,9 @@ class IBMZZVMNodes(NodesBase):
     def start_nodes(self, nodes):
         """
         Start z/VM guest nodes
+        
+        After starting nodes, automatically approves any pending CSRs
+        to allow nodes to rejoin the cluster.
         
         Args:
             nodes (list): List of OCP node objects
@@ -3926,6 +3938,9 @@ class IBMZZVMNodes(NodesBase):
             except Exception as e:
                 logger.error(f"Failed to start {node.name}: {e}")
                 raise
+        
+        # CSR approval is handled within bastion_mgr.start_node()
+        logger.info("Node startup complete. CSRs have been automatically approved.")
     
     def restart_nodes(self, nodes, force=True, wait=True, timeout=900):
         """
