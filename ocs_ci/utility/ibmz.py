@@ -250,12 +250,82 @@ class ZVMBastionManager:
                 logger.error(f"Shutdown failed for {node_name}: {e}")
                 raise CommandFailed(f"Failed to shutdown {node_name}: {e}")
     
+    def _approve_node_csrs(self, node_name, timeout=300):
+        """
+        Approve pending CSRs for a node after restart
+        
+        Args:
+            node_name (str): Name of the node
+            timeout (int): Timeout in seconds to wait for CSRs
+            
+        Returns:
+            bool: True if CSRs were approved
+        """
+        from ocs_ci.utility.utils import run_cmd
+        import time
+        
+        logger.info(f"Waiting for and approving CSRs for node {node_name}")
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                # Get pending CSRs
+                cmd = "oc get csr -o json"
+                result = run_cmd(cmd, timeout=30)
+                
+                import json
+                # run_cmd returns stdout as string, handle both string and bytes
+                if isinstance(result, bytes):
+                    csrs = json.loads(result.decode())
+                else:
+                    csrs = json.loads(str(result))
+                
+                # Find pending CSRs for this node
+                approved_count = 0
+                for csr in csrs.get('items', []):
+                    csr_name = csr['metadata']['name']
+                    
+                    # Check if CSR is pending
+                    conditions = csr.get('status', {}).get('conditions', [])
+                    is_pending = not any(c.get('type') == 'Approved' for c in conditions)
+                    
+                    if not is_pending:
+                        continue
+                    
+                    # Check if CSR is for our node
+                    spec = csr.get('spec', {})
+                    username = spec.get('username', '')
+                    
+                    # CSRs can be from node-bootstrapper or from the node itself
+                    if node_name in username or 'node-bootstrapper' in username:
+                        logger.info(f"Approving CSR {csr_name} for node {node_name}")
+                        approve_cmd = f"oc adm certificate approve {csr_name}"
+                        run_cmd(approve_cmd, timeout=30)
+                        approved_count += 1
+                
+                if approved_count > 0:
+                    logger.info(f"Approved {approved_count} CSRs for {node_name}")
+                    # Wait a bit and check again for any additional CSRs
+                    time.sleep(10)
+                else:
+                    # No pending CSRs found, we're done
+                    logger.info(f"No more pending CSRs for {node_name}")
+                    return True
+                    
+            except Exception as e:
+                logger.warning(f"Error checking/approving CSRs: {e}")
+                time.sleep(5)
+        
+        logger.warning(f"Timeout waiting for CSRs for {node_name}")
+        return False
+    
     def start_node(self, node_obj):
         """
         Start a z/VM guest node using the Python automation script
         
         Uses the ZVM_BOOT_NODES_3270.py script with --reboot 1 flag to properly
-        start the z/VM guest and boot from disk.
+        start the z/VM guest and boot from disk. Also automatically approves
+        any pending CSRs for the node after restart.
         
         Args:
             node_obj: OCP node object
@@ -267,8 +337,9 @@ class ZVMBastionManager:
         zvm_user = node_config['zvm']['user']
         zvm_host = node_config['zvm']['host']
         zvm_pass = node_config['zvm']['password']
+        node_name = node_obj.name
         
-        logger.info(f"Starting z/VM guest: {zvm_user}")
+        logger.info(f"Starting z/VM guest: {zvm_user} (node: {node_name})")
         
         # Build disk configuration
         disk_args = []
@@ -342,6 +413,15 @@ class ZVMBastionManager:
             raise CommandFailed(f"Failed to start {zvm_user}: {stderr}")
         
         logger.info(f"Successfully started {zvm_user}")
+        
+        # Approve any pending CSRs for this node
+        try:
+            self._approve_node_csrs(node_name, timeout=300)
+        except Exception as e:
+            logger.warning(f"Failed to approve CSRs for {node_name}: {e}")
+            # Don't fail the start operation if CSR approval fails
+            # as it might be approved manually or automatically by other means
+        
         return True
     
     def reboot_node(self, node_obj):
